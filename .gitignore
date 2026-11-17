@@ -3,3 +3,4 @@
 *.tmp
 .DS_Store
 route-helper
+/bypass-routes.local.txt

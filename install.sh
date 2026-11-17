@@ -13,11 +13,19 @@ title() { echo -e "\n${BOLD}$*${RESET}"; }
 # ── 加载共享配置 ──────────────────────────────────────────────────
 source "$SCRIPT_DIR/tailscale-routes.conf"
 PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+REPO_ROUTES_FILE="$SCRIPT_DIR/bypass-routes.local.txt"
+EXAMPLE_ROUTES_FILE="$SCRIPT_DIR/bypass-routes.example.txt"
 
 # ── 检查环境 ──────────────────────────────────────────────────────
 title "1. 检查环境"
 
 [[ "$(uname)" != "Darwin" ]] && error "仅支持 macOS"
+if [[ ! -e "$REPO_ROUTES_FILE" && ! -L "$REPO_ROUTES_FILE" ]]; then
+  # 首次安装从示例初始化，之后以本地文件为准。
+  cp "$EXAMPLE_ROUTES_FILE" "$REPO_ROUTES_FILE"
+  info "已从示例创建本地规则: $REPO_ROUTES_FILE"
+fi
+[[ -f "$REPO_ROUTES_FILE" && -r "$REPO_ROUTES_FILE" ]] || error "无法读取路由规则: $REPO_ROUTES_FILE"
 
 if ! command -v tailscale &>/dev/null \
   && [[ ! -d "/Applications/Tailscale.app" ]]; then
@@ -55,18 +63,20 @@ sudo mkdir -p "$CONF_INSTALL_DIR"
 sudo cp "$SCRIPT_DIR/tailscale-routes.conf" "$CONF_INSTALL_DIR/tailscale-routes.conf"
 info "配置已安装到 $CONF_INSTALL_DIR/tailscale-routes.conf"
 
-# ── 安装路由配置文件(已存在则跳过，不覆盖用户数据)────────────
+# ── 同步本地路由规则 ────────────────────────────────────────
 title "4. 安装路由配置"
 
-if [[ -f "$ROUTES_FILE" ]]; then
-  warn "路由文件已存在，跳过(保留您的配置): $ROUTES_FILE"
-elif [[ -f "$SCRIPT_DIR/bypass-routes.txt" ]]; then
-  sudo cp "$SCRIPT_DIR/bypass-routes.txt" "$ROUTES_FILE"
-  info "路由文件已安装到 $ROUTES_FILE"
-  info "请编辑该文件，添加需要直连的 IP 段"
+[[ ! -d "$ROUTES_FILE" ]] || error "运行配置路径是目录: $ROUTES_FILE"
+if cmp -s "$REPO_ROUTES_FILE" "$ROUTES_FILE"; then
+  info "运行配置已与本地规则一致: $ROUTES_FILE"
 else
-  sudo touch "$ROUTES_FILE"
-  warn "未找到示例 bypass-routes.txt，已创建空文件: $ROUTES_FILE"
+  # 在目标目录原子替换，避免运行中的守护进程读到写了一半的配置。
+  staged_routes="$(sudo mktemp "${ROUTES_FILE}.tmp.XXXXXX")"
+  trap 'sudo rm -f "$staged_routes"' EXIT
+  sudo install -m 0644 "$REPO_ROUTES_FILE" "$staged_routes"
+  sudo mv -f "$staged_routes" "$ROUTES_FILE"
+  trap - EXIT
+  info "已同步本地规则到 $ROUTES_FILE"
 fi
 
 # ── 配置 sudo 免密(仅对 route-helper)──────────────────────────
@@ -110,4 +120,5 @@ echo "  停止守护进程  : tailscale-routes stop"
 echo "  启动守护进程  : tailscale-routes start"
 echo "  查看日志      : tail -f $LOG_FILE"
 echo ""
-echo "路由配置文件    : $ROUTES_FILE"
+echo "规则源文件      : $REPO_ROUTES_FILE"
+echo "运行配置文件    : $ROUTES_FILE"

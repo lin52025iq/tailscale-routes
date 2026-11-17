@@ -7,7 +7,7 @@
  *   echo "1.2.3.0/24" | sudo route-helper del
  *
  * stdin: 每行一个 CIDR（由调用方预先过滤注释和空行）
- * stdout: JSON 统计 {"total":N,"added":N,"changed":N,"failed":N}
+ * stdout: JSON 统计，添加操作还会返回成功写入的路由列表
  * exit: 0=全部成功, 1=部分失败, 2=致命错误
  */
 
@@ -17,10 +17,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define BUF_SIZE 512
 
@@ -112,6 +115,81 @@ build_msg(char *buf, int type, int seq,
     return hdr->rtm_msglen;
 }
 
+/* 仅管理本工具拥有的 supplemental resolver，避免改写用户已有的 DNS 设置。 */
+static int
+update_resolvers(int add)
+{
+    static const char contents[] =
+        "# tailscale-routes\nnameserver 127.0.0.1\nport 15353\n";
+    if (add && mkdir("/etc/resolver", 0755) < 0 && errno != EEXIST)
+        return 2;
+
+    int dir = open("/etc/resolver", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir < 0)
+        return (!add && errno == ENOENT) ? 0 : 2;
+
+    struct stat st;
+    if (fstat(dir, &st) < 0 || st.st_uid != 0 || (st.st_mode & 0022)) {
+        close(dir);
+        return 2;
+    }
+
+    char name[256];
+    int failures = 0;
+    while (fgets(name, sizeof(name), stdin)) {
+        /* 域名直接用作文件名。拒绝路径、隐藏文件和未经验证的字节。 */
+        size_t n = strcspn(name, "\n");
+        if (name[n] != '\n' || n == 0 || n > 253 || name[0] == '.' ||
+            name[n - 1] == '.') {
+            failures++;
+            continue;
+        }
+        name[n] = '\0';
+        if (strspn(name, "abcdefghijklmnopqrstuvwxyz0123456789.-") != n) {
+            failures++;
+            continue;
+        }
+
+        int fd = openat(dir, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+        if (fd >= 0) {
+            char current[sizeof(contents)];
+            int owned = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                        st.st_uid == 0 && !(st.st_mode & 0022) &&
+                        read(fd, current, sizeof(current)) == sizeof(contents) - 1 &&
+                        memcmp(current, contents, sizeof(contents) - 1) == 0;
+            close(fd);
+            if (add && !owned)
+                failures++;
+            else if (!add && owned && unlinkat(dir, name, 0) < 0 && errno != ENOENT)
+                failures++;
+            continue;
+        }
+        if (errno != ENOENT) {
+            failures++;
+            continue;
+        }
+
+        if (add) {
+            /* 先写完整内容再发布，并保留在此期间出现的同名配置。 */
+            char temporary[] = "/etc/resolver/.tailscale-routes.XXXXXX";
+            fd = mkstemp(temporary);
+            if (fd < 0) {
+                failures++;
+                continue;
+            }
+            const char *basename = strrchr(temporary, '/') + 1;
+            if (write(fd, contents, sizeof(contents) - 1) != sizeof(contents) - 1 ||
+                fchmod(fd, 0644) < 0 || linkat(dir, basename, dir, name, 0) < 0)
+                failures++;
+            close(fd);
+            unlinkat(dir, basename, 0);
+        }
+    }
+    close(dir);
+    printf("{\"failed\":%d}\n", failures);
+    return failures ? 1 : 0;
+}
+
 /* ── main ───────────────────────────────────────────────────── */
 
 int
@@ -126,7 +204,13 @@ main(int argc, char *argv[])
         return 2;
     }
 
-    int is_add = (strcmp(argv[1], "add") == 0);
+    if (argc == 2 && strcmp(argv[1], "resolver-add") == 0)
+        return update_resolvers(1);
+    if (argc == 2 && strcmp(argv[1], "resolver-del") == 0)
+        return update_resolvers(0);
+
+    int new_only = (strcmp(argv[1], "add-new") == 0);
+    int is_add = new_only || (strcmp(argv[1], "add") == 0);
     int is_del = (strcmp(argv[1], "del") == 0);
 
     if (!is_add && !is_del) {
@@ -163,6 +247,9 @@ main(int argc, char *argv[])
     int total = 0, added = 0, changed = 0, deleted = 0, failed = 0;
     int seq = 0;
 
+    if (is_add)
+        printf("{\"applied\":[");
+
     /* 逐行处理 stdin */
     while (fgets(line, sizeof(line), stdin)) {
         line[strcspn(line, "\r\n")] = '\0';
@@ -178,6 +265,10 @@ main(int argc, char *argv[])
         }
 
         total++;
+        if (new_only && net_mask.s_addr != htonl(UINT32_MAX)) {
+            failed++;
+            continue;
+        }
 
         /* PF_ROUTE write() 是原子操作，不会出现 partial write */
         if (is_add) {
@@ -185,18 +276,25 @@ main(int argc, char *argv[])
                                 net_addr, &gw_addr, net_mask);
             if (write(s, buf, len) < 0) {
                 if (errno == EEXIST) {
+                    /* DNS 发现的地址可能已有系统路由，保留原路由的控制权。 */
+                    if (new_only)
+                        continue;
                     /* 路由已存在，降级为 change */
                     len = build_msg(buf, RTM_CHANGE, ++seq,
                                     net_addr, &gw_addr, net_mask);
                     if (write(s, buf, len) < 0) {
                         failed++;
                     } else {
+                        printf("%s\"%s/%d\"", (added + changed) ? "," : "",
+                               inet_ntoa(net_addr), __builtin_popcount(net_mask.s_addr));
                         changed++;
                     }
                 } else {
                     failed++;
                 }
             } else {
+                printf("%s\"%s/%d\"", (added + changed) ? "," : "",
+                       inet_ntoa(net_addr), __builtin_popcount(net_mask.s_addr));
                 added++;
             }
         } else {
@@ -218,7 +316,7 @@ main(int argc, char *argv[])
 
     /* 输出 JSON 统计 */
     if (is_add)
-        printf("{\"total\":%d,\"added\":%d,\"changed\":%d,\"failed\":%d}\n",
+        printf("],\"total\":%d,\"added\":%d,\"changed\":%d,\"failed\":%d}\n",
                total, added, changed, failed);
     else
         printf("{\"total\":%d,\"deleted\":%d,\"failed\":%d}\n",

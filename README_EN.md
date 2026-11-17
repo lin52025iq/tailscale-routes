@@ -60,7 +60,7 @@ The installer automatically: compiles the C route helper, installs the Python co
 | `/usr/local/bin/route-helper` | Create | Compiled C routing helper binary |
 | `/usr/local/bin/tailscale-routes` | Create | Python controller script |
 | `/usr/local/etc/tailscale-routes.conf` | Create | Shared path configuration |
-| `/usr/local/etc/bypass-routes.txt` | Create (if absent) | Route config file; skipped if already exists |
+| `/usr/local/etc/bypass-routes.txt` | Sync | Copied from `bypass-routes.local.txt` when the contents differ |
 | `/etc/sudoers.d/tailscale-routes` | Create (requires sudo) | Passwordless sudo rule for current user on route-helper |
 | `~/Library/LaunchAgents/com.local.tailscale-routes.plist` | Create | launchd user agent generated from template |
 
@@ -68,7 +68,7 @@ The installer automatically: compiles the C route helper, installs the Python co
 
 ## Configuring Routes
 
-Edit `/usr/local/etc/bypass-routes.txt`, one CIDR per line, `#` for comments:
+If `bypass-routes.local.txt` is missing, `./install.sh` creates it from `bypass-routes.example.txt`. Edit `bypass-routes.local.txt` and run `./install.sh` again to sync it to `/usr/local/etc/bypass-routes.txt`. Git ignores the local file. Each line can contain an IPv4 address, CIDR, exact hostname, or wildcard hostname. Use `#` for comments.
 
 ```
 # Private networks (LAN direct access)
@@ -79,9 +79,16 @@ Edit `/usr/local/etc/bypass-routes.txt`, one CIDR per line, `#` for comments:
 114.114.114.0/24
 223.5.5.0/24
 1.1.1.0/24
+203.0.113.7
+
+# Exact and wildcard hostnames
+api.example.com
+*.cdn.example.com
 ```
 
-Changes take effect within 5 seconds (hot-reload) — no restart or manual action required.
+`*.cdn.example.com` matches subdomains at any depth. Add `cdn.example.com` separately to include the parent. The daemon reloads changes to the installed file automatically. Rules apply only while Tailscale is connected with an exit node selected. Disconnecting removes the bypass routes and resolver entries.
+
+Domain rules learn IPv4 routes from macOS system DNS queries and expire them based on DNS TTL. Existing caches, apps with their own encrypted DNS, and IPv6 connections may bypass this mechanism. Hostnames sharing an IPv4 address share the same route. Domain rules use `127.0.0.1:15353`. Existing `/etc/resolver` entries for the same name are preserved.
 
 > **Note**: Routes in `bypass-routes.txt` must not cover the probe IP (default `8.8.8.8`, configurable via `PROBE_IP` in `tailscale-routes.conf`). This IP is used to detect whether the exit node is active. If a bypass route covers it, detection breaks. The program automatically excludes conflicting routes and logs an error, but it's best to avoid the conflict altogether.
 
@@ -92,8 +99,8 @@ Changes take effect within 5 seconds (hot-reload) — no restart or manual actio
 | `tailscale-routes status` | Show daemon, exit node status, gateway, active route count, recent logs |
 | `tailscale-routes start` | Start the daemon |
 | `tailscale-routes stop` | Stop the daemon and clean up routes |
-| `tailscale-routes add` | Manually add routes (for debugging) |
-| `tailscale-routes remove` | Manually remove routes |
+| `tailscale-routes add` | Start the daemon when the exit node is active |
+| `tailscale-routes remove` | Same as `stop` |
 | `tail -f /tmp/tailscale-routes.log` | Watch daemon logs in real time |
 
 ## Uninstall
@@ -102,7 +109,7 @@ Changes take effect within 5 seconds (hot-reload) — no restart or manual actio
 ./uninstall.sh
 ```
 
-Stops the daemon, cleans up routes, and removes all installed files. The `bypass-routes.txt` configuration is preserved — delete it manually if needed.
+Stops the daemon, cleans up routes and resolver entries, and removes the installed files. The `bypass-routes.txt` configuration is preserved — delete it manually if needed.
 
 ## File Reference
 
@@ -110,7 +117,8 @@ Stops the daemon, cleans up routes, and removes all installed files. The `bypass
 |------|---------|
 | `tailscale-routes.py` | Python controller: state machine, gateway detection, hot-reload, logging |
 | `route-helper.c` | C routing helper: PF_ROUTE socket bulk route operations |
-| `bypass-routes.txt` | IP ranges to bypass VPN (example config) |
+| `bypass-routes.example.txt` | Versioned example of IPv4 and hostname bypass rules |
+| `bypass-routes.local.txt` | Local rules used by the installer, ignored by Git |
 | `tailscale-routes.conf` | Shared path configuration for all scripts |
 | `com.local.tailscale-routes.plist.template` | launchd agent template |
 | `install.sh` | One-command installer (compile + deploy + register service) |

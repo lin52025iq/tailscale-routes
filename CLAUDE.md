@@ -2,7 +2,7 @@
 
 ## 项目目标
 
-在 macOS 上启用 Tailscale exit node 时，让 `bypass-routes.txt` 里列出的 IP 段绕过 VPN，继续走物理网关直连。
+在 macOS 上启用 Tailscale exit node 时，让 `bypass-routes.txt` 里列出的 IPv4 网段和域名绕过 VPN，继续走物理网关直连。
 
 核心原理：Tailscale 会下发 `0.0.0.0/1` 和 `128.0.0.0/1` 两条 /1 路由覆盖全网。利用路由表最长前缀匹配，手动添加更精确的 /8、/16、/24 就能把这些网段抢回本地出口。
 
@@ -46,9 +46,9 @@ Python 单文件主程序 + C 路由助手，两层分工：
 
 - **幂等**：C 助手 add 遇 EEXIST 降级为 RTM_CHANGE，del 遇 ESRCH 静默跳过。
 - **最小权限 sudo**：sudoers 只授权安装者本人（`$USER`）对 `route-helper` 免密，不使用 setuid。
-- **bypass-routes.txt 不需要 sudo**：`/usr/local/etc/` 在装了 Homebrew 的 macOS 上是用户可写的。
+- **本地配置为安装来源**：编辑 Git 忽略的 `bypass-routes.local.txt`，由安装脚本同步到运行配置。首次安装从 `bypass-routes.example.txt` 初始化。
 - **用户级 LaunchAgent**：plist 安装到 `~/Library/LaunchAgents/`（非系统 Daemon），以当前用户身份运行。
-- **exit node 双重检测**：`is_exit_node_active()` 先用 `pgrep` 确认 Tailscale 进程在运行，再用 `route -n get` 检查路由是否走 utun。避免其他 VPN 的 utun 接口造成误判。
+- **exit node 双重检测**：`is_exit_node_active()` 先用 `pgrep` 确认 Tailscale 进程在运行，再用 `route -n get` 检查路由是否走 utun。运行时还需要确认后端状态和本机已选择 exit node，避免其他 VPN 的 utun 接口造成误判。
 - **探测 IP 冲突自动排除**：`load_routes()` 会检查每条 CIDR 是否覆盖 `PROBE_IP`，覆盖的自动排除并记 error 日志，防止检测失效。
 - **空网关防御**：`get_gateway()` 返回 None 时不触发路由操作，等下一轮轮询。
 - **只用系统自带工具**：Python 只用标准库（兼容 3.9+），C 只用系统头文件，不引入第三方依赖。
@@ -68,7 +68,7 @@ tailscale-routes status     # 查看当前状态 + 最近日志
 tailscale-routes start      # 启动守护进程
 tailscale-routes stop       # 停止守护进程并清理路由
 tailscale-routes add        # 手动添加路由
-tailscale-routes remove     # 手动删除路由
+tailscale-routes remove     # 停止守护进程并清理规则
 tailscale-routes watch      # 前台运行守护进程
 ./install.sh                # 编译 C 助手 + 安装到 /usr/local + 注册 launchd
 ./uninstall.sh              # 完全卸载
@@ -94,4 +94,3 @@ plist 使用模板 `com.local.tailscale-routes.plist.template`，安装时由 `i
 ## 还没有做的事
 
 - IPv6 旁路路由
-- 按域名分流（需要 DNS 拦截，架构差异大）
