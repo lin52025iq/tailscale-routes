@@ -171,10 +171,12 @@ def should_apply_routes(probe_ip):
     )
     if cli is None:
         return False
+    # launchd 没有终端环境，显式要求 macOS 应用程序进入 CLI 模式。
+    cli_env = dict(os.environ, TAILSCALE_BE_CLI="1")
     try:
         result = subprocess.run(
             [cli, "debug", "prefs"], check=True,
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=3, env=cli_env,
         )
         prefs = json.loads(result.stdout)
         if not isinstance(prefs, dict) or prefs.get("WantRunning") is not True:
@@ -185,7 +187,7 @@ def should_apply_routes(probe_ip):
         # 使用后端状态确认连接，避免其他 VPN 的 utun 恰好匹配探测地址。
         result = subprocess.run(
             [cli, "status", "--json"], check=True,
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=3, env=cli_env,
         )
         status = json.loads(result.stdout)
         return isinstance(status, dict) and status.get("BackendState") == "Running"
